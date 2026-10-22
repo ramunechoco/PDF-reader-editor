@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; script-src 'self' 'wasm-unsafe-eval'">
+  <title>PDF Editor</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="../node_modules/pdf-lib/dist/pdf-lib.min.js"></script>
+  <script src="../node_modules/@pdf-lib/fontkit/dist/fontkit.umd.min.js"></script>
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header id="toolbar">
+    <div class="group">
+      <button id="btn-open" title="Open (Ctrl+O)">Open</button>
+      <button id="btn-save" title="Save (Ctrl+S)" disabled>Save</button>
+      <button id="btn-save-as" title="Save As (Ctrl+Shift+S)" disabled>Save As</button>
+    </div>
+    <div class="group tools" id="tools">
+      <button data-tool="select" class="active" title="Select / fill forms (Esc)">Select</button>
+      <button data-tool="text" title="Click on a page to add a text box (T)">Add Text</button>
+      <button data-tool="edit" title="Click existing text to replace it (E)">Edit Text</button>
+      <button data-tool="whiteout" title="Drag to cover content with a box (W)">Whiteout</button>
+      <button data-tool="image" title="Pick an image, then click to place it (I)">Image</button>
+    </div>
+    <div class="group props hidden" id="props">
+      <select id="prop-font" title="Font">
+        <option value="Helvetica">Helvetica</option>
+        <option value="Times">Times</option>
+        <option value="Courier">Courier</option>
+      </select>
+      <input id="prop-size" type="number" min="4" max="144" step="1" title="Font size">
+      <button id="prop-bold" title="Bold"><b>B</b></button>
+      <input id="prop-color" type="color" title="Color">
+      <button id="prop-delete" title="Delete (Del)">Delete</button>
+    </div>
+    <div class="spacer"></div>
+    <div class="group">
+      <button id="btn-zoom-out" title="Zoom out (Ctrl+-)">−</button>
+      <span id="zoom-label">100%</span>
+      <button id="btn-zoom-in" title="Zoom in (Ctrl+=)">+</button>
+      <button id="btn-fit" title="Fit width (Ctrl+0)">Fit</button>
+    </div>
+    <div class="group">
+      <span id="page-label"></span>
+    </div>
+  </header>
+  <main id="viewer">
+    <div id="empty">
+      <p>Open a PDF to get started</p>
+      <button id="btn-open-empty">Open PDF…</button>
+      <p class="hint">or drag a file onto this window</p>
+    </div>
+    <div id="pages"></div>
+  </main>
+  <div id="status"></div>
+</body>
+</html>
