@@ -88,7 +88,8 @@ input[type=color] {
 .layer { position: absolute; left: 0; top: 0; transform-origin: 0 0; pointer-events: none; }
 .layer > * { pointer-events: auto; }
 .overlay-layer { z-index: 2; }
-.form-layer { z-index: 3; }
+.annot-layer { z-index: 3; }
+.form-layer { z-index: 4; }
 
 body[data-tool=text] .page,
 body[data-tool=image] .page,

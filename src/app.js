@@ -26,6 +26,8 @@ const state = {
   scale: 1,
   tool: 'select',
   overlays: [],        // added content: text boxes, whiteout boxes, images
+  deletedAnnots: [],
+  hiddenAnnotIds: new Set(),
   selected: null,
   fields: new Map(),   // form field name -> { type, value, dirty, elements }
   dirty: false,
@@ -108,7 +110,11 @@ async function openFile(info, keepView = false) {
 
   Object.assign(state, {
     file: { path: info.path, name: info.name },
-    bytes, pdf, loadingTask, pages: [], overlays: [], selected: null, fields: new Map(), dirty: false,
+    bytes, pdf, loadingTask, pages: [], overlays: [], deletedAnnots: [], hiddenAnnotIds: new Set(),
+    selected: null, fields: new Map(), dirty: false,
+  });
+  Object.defineProperty(pdf.annotationStorage, 'modifiedIds', {
+    get: () => ({ ids: state.hiddenAnnotIds, hash: [...state.hiddenAnnotIds].join(',') }),
   });
   window.api.setDirty(false);
   updateTitle();
@@ -149,16 +155,18 @@ function createPage(pdfPage, index) {
   const canvas = document.createElement('canvas');
   const overlayLayer = document.createElement('div');
   overlayLayer.className = 'layer overlay-layer';
+  const annotLayer = document.createElement('div');
+  annotLayer.className = 'layer annot-layer';
   const formLayer = document.createElement('div');
   formLayer.className = 'layer form-layer';
-  for (const layer of [overlayLayer, formLayer]) {
+  for (const layer of [overlayLayer, annotLayer, formLayer]) {
     layer.style.width = `${base.width}px`;
     layer.style.height = `${base.height}px`;
   }
-  el.append(canvas, overlayLayer, formLayer);
+  el.append(canvas, overlayLayer, annotLayer, formLayer);
 
-  const page = { index, pdfPage, base, el, canvas, overlayLayer, formLayer,
-    renderedScale: 0, renderTask: null, formsBuilt: false, textContent: null };
+  const page = { index, pdfPage, base, el, canvas, overlayLayer, annotLayer, formLayer,
+    renderedScale: 0, renderTask: null, annotationsBuilt: null, textContent: null };
   el.addEventListener('pointerdown', (e) => onPagePointerDown(e, page));
   return page;
 }
@@ -175,7 +183,7 @@ function applyScale() {
   for (const p of state.pages) {
     p.el.style.width = `${p.base.width * s}px`;
     p.el.style.height = `${p.base.height * s}px`;
-    p.overlayLayer.style.transform = p.formLayer.style.transform = `scale(${s})`;
+    p.overlayLayer.style.transform = p.annotLayer.style.transform = p.formLayer.style.transform = `scale(${s})`;
   }
   $('#zoom-label').textContent = `${Math.round(s * 100)}%`;
   visiblePages.forEach(renderPage);
@@ -196,6 +204,12 @@ function setScale(newScale) {
 async function renderPage(page) {
   const scale = state.scale;
   if (page.renderedScale === scale || page.renderingScale === scale) return;
+  page.renderingScale = scale;
+  await (page.annotationsBuilt ??= buildAnnotations(page));
+  if (state.scale !== scale) {
+    if (page.renderingScale === scale) page.renderingScale = 0;
+    return;
+  }
   page.renderTask?.cancel();
 
   const area = page.base.width * page.base.height;
@@ -224,11 +238,6 @@ async function renderPage(page) {
   page.canvas.replaceWith(canvas);
   page.canvas = canvas;
   page.renderedScale = scale;
-
-  if (!page.formsBuilt) {
-    page.formsBuilt = true;
-    await buildForms(page);
-  }
 }
 
 function updatePageLabel() {
@@ -270,12 +279,13 @@ function setFieldValue(name, value, source) {
   markDirty();
 }
 
-async function buildForms(page) {
+async function buildAnnotations(page) {
   let annotations;
   try { annotations = await page.pdfPage.getAnnotations({ intent: 'display' }); }
   catch (err) { console.warn('Could not read annotations', err); return; }
 
   for (const a of annotations) {
+    if (a.subtype === 'FreeText') addFreeText(page, a);
     if (a.subtype !== 'Widget' || a.hidden || !a.fieldName) continue;
     const name = a.fieldName;
     const r = rectToView(page.base, a.rect);
@@ -336,7 +346,36 @@ async function buildForms(page) {
   }
 }
 
+function toHex(rgbArray) {
+  return '#' + [...rgbArray].map((c) => Math.round(c).toString(16).padStart(2, '0')).join('');
+}
+
+function addFreeText(page, a) {
+  if (a.hidden || a.rotation || page.pdfPage.rotate || !a.textContent || !a.textPosition) return;
+  const da = a.defaultAppearanceData;
+  const span = a.richText?.html?.children?.[0]?.children?.[0]?.attributes?.style;
+  const family = fontFamilyFromName(da.fontName);
+  const size = Math.round(da.fontSize * 100) / 100;
+  const [left, baseline] = page.base.convertToViewportPoint(a.rect[0] + a.textPosition[0], a.rect[1] + a.textPosition[1]);
+  const m = {
+    type: 'text', pageIndex: page.index, text: a.textContent.join('\n'), size, font: family,
+    bold: /bold/i.test(da.fontName) || span?.fontWeight === 'bold',
+    color: span?.color || toHex(da.fontColor),
+    x: left, y: baseline - size * BASELINE[family],
+    annot: { id: a.id, popupId: a.popupRef || null, pageIndex: page.index, modified: false },
+  };
+  m.id = state.nextId++;
+  state.overlays.push(m);
+  state.hiddenAnnotIds.add(a.id);
+  renderOverlay(m);
+}
+
 // ---------------------------------------------------------------- overlays
+
+function touch(m) {
+  if (m.annot) m.annot.modified = true;
+  markDirty();
+}
 
 function addOverlay(model) {
   model.id = state.nextId++;
@@ -351,6 +390,7 @@ function removeOverlay(m) {
   m.el.remove();
   state.overlays = state.overlays.filter((o) => o !== m);
   if (m.url) URL.revokeObjectURL(m.url);
+  if (m.annot) state.deletedAnnots.push(m.annot);
   if (state.selected === m) select(null);
   markDirty();
 }
@@ -366,7 +406,7 @@ function renderOverlay(m) {
     content.contentEditable = 'plaintext-only';
     content.spellcheck = false;
     content.textContent = m.text;
-    content.addEventListener('input', () => { m.text = content.innerText; markDirty(); });
+    content.addEventListener('input', () => { m.text = content.innerText; touch(m); });
     content.addEventListener('focus', () => select(m));
     content.addEventListener('blur', () => {
       m.text = content.innerText.replace(/\n$/, '');
@@ -397,7 +437,8 @@ function renderOverlay(m) {
   });
 
   updateOverlayEl(m);
-  state.pages[m.pageIndex].overlayLayer.append(el);
+  const page = state.pages[m.pageIndex];
+  (m.annot ? page.annotLayer : page.overlayLayer).append(el);
 }
 
 function updateOverlayEl(m) {
@@ -436,7 +477,7 @@ function startDrag(e, m, mode) {
       if (m.type === 'image' && !ev.shiftKey) m.h = m.w * (start.h / start.w);
     }
     updateOverlayEl(m);
-    markDirty();
+    touch(m);
   };
   const onUp = () => {
     target.removeEventListener('pointermove', onMove);
@@ -490,7 +531,7 @@ function changeProp(key, value) {
   if (m.type === 'text') textDefaults[key] = value;
   updateOverlayEl(m);
   updateProps();
-  markDirty();
+  touch(m);
 }
 
 $('#prop-font').addEventListener('change', (e) => changeProp('font', e.target.value));
@@ -571,16 +612,28 @@ function drawWhiteout(e, page, start) {
   window.addEventListener('pointerup', onUp);
 }
 
+function fontFamilyFromName(name = '') {
+  return /courier|mono/i.test(name) ? 'Courier'
+    : /times|roman|serif|georgia|garamond|cambria|book/i.test(name) && !/sans/i.test(name) ? 'Times'
+    : 'Helvetica';
+}
+
 function guessFont(page, fontId) {
   let name = '';
   try { name = page.pdfPage.commonObjs.get(fontId)?.name || ''; } catch { /* font not loaded */ }
-  const family = /courier|mono/i.test(name) ? 'Courier'
-    : /times|roman|serif|georgia|garamond|cambria|book/i.test(name) && !/sans/i.test(name) ? 'Times'
-    : 'Helvetica';
-  return { family, bold: /bold|black|heavy|semibold|demi/i.test(name) };
+  return { family: fontFamilyFromName(name), bold: /bold|black|heavy|semibold|demi/i.test(name) };
 }
 
 async function editTextAt(page, pt) {
+  const box = state.overlays.find((m) => m.type === 'text' && m.pageIndex === page.index
+    && pt.x >= m.x && pt.x <= m.x + m.el.offsetWidth && pt.y >= m.y && pt.y <= m.y + m.el.offsetHeight);
+  if (box) {
+    setTool('select');
+    select(box);
+    focusText(box, true);
+    return;
+  }
+
   page.textContent ??= await page.pdfPage.getTextContent();
   const vp = page.base;
   let best = null;
@@ -677,7 +730,8 @@ async function save(saveAs = false) {
   }
   try {
     toast('Saving…', false, 10000);
-    const out = await buildPdf(state.bytes, { fields: state.fields, overlays: state.overlays, pages: state.pages });
+    const out = await buildPdf(state.bytes, { fields: state.fields, overlays: state.overlays,
+      deletedAnnots: state.deletedAnnots, pages: state.pages });
     const saved = await window.api.savePdf(target, out);
     // Reload from the saved bytes so added content becomes part of the document.
     await openFile({ ...saved, bytes: out }, true);

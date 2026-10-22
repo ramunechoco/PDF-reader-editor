@@ -1,8 +1,10 @@
 // Builds the output PDF: applies form-field values and draws added overlays
 // (text boxes, whiteout boxes, images) onto the original document with pdf-lib.
 
-const { PDFDocument, StandardFonts, rgb, degrees, PDFName, PDFBool, PDFHexString,
-  PDFTextField, PDFCheckBox, PDFRadioGroup, PDFDropdown, PDFOptionList } = window.PDFLib;
+const { PDFDocument, StandardFonts, rgb, degrees, PDFName, PDFBool, PDFHexString, PDFString, PDFRef, PDFDict,
+  PDFTextField, PDFCheckBox, PDFRadioGroup, PDFDropdown, PDFOptionList,
+  pushGraphicsState, popGraphicsState, beginText, endText, setFontAndSize, moveText, showText,
+  setFillingRgbColor } = window.PDFLib;
 
 const STANDARD = {
   Helvetica: [StandardFonts.Helvetica, StandardFonts.HelveticaBold],
@@ -66,12 +68,77 @@ function applyField(field, f) {
   }
 }
 
+function refFromId(id) {
+  const match = /^(\d+)R(\d*)$/.exec(id || '');
+  return match ? PDFRef.of(+match[1], +(match[2] || 0)) : null;
+}
+
+const DA_FONT = { Helvetica: 'Helv', Times: 'TiRo', Courier: 'Cour' };
+const CSS_FONT = { Helvetica: 'Helvetica,sans-serif', Times: 'Times New Roman,serif', Courier: 'Courier New,monospace' };
+
+async function rewriteFreeText(pdfDoc, fonts, m, vp) {
+  const ref = refFromId(m.annot.id);
+  const dict = ref && pdfDoc.context.lookupMaybe(ref, PDFDict);
+  if (!dict) { console.warn('Annotation not found', m.annot.id); return; }
+
+  const text = m.text.replace(/\r/g, '').replace(/\n+$/, '');
+  const lines = text.split('\n');
+  const font = await fonts.get(m.font, m.bold, lines.join(''));
+  const pad = 1;
+  const lineH = m.size * 1.2;
+  const width = Math.max(...lines.map((l) => font.widthOfTextAtSize(l, m.size)), 1) + pad * 2;
+  const height = lineH * lines.length + pad * 2;
+  const [left, top] = vp.convertToPdfPoint(m.x - pad, m.y - pad);
+  const rect = [left, top - height, left + width, top];
+
+  const c = hexToRgb(m.color);
+  const ops = [pushGraphicsState(), beginText(), setFontAndSize('F1', m.size),
+    setFillingRgbColor(c.red, c.green, c.blue)];
+  lines.forEach((line, i) => {
+    const y = height - pad - m.size * (i * 1.2 + BASELINE[m.font]);
+    ops.push(moveText(i === 0 ? pad : 0, i === 0 ? y : -lineH));
+    if (line) ops.push(showText(font.encodeText(line)));
+  });
+  ops.push(endText(), popGraphicsState());
+  const ap = pdfDoc.context.formXObject(ops, {
+    BBox: [0, 0, width, height],
+    Resources: { Font: { F1: font.ref } },
+  });
+
+  const ctx = pdfDoc.context;
+  dict.set(PDFName.of('Rect'), ctx.obj(rect));
+  dict.set(PDFName.of('AP'), ctx.obj({ N: ctx.register(ap) }));
+  dict.set(PDFName.of('Contents'), PDFHexString.fromText(text));
+  dict.set(PDFName.of('M'), PDFString.fromDate(new Date()));
+  dict.set(PDFName.of('DA'), PDFString.of(
+    `/${DA_FONT[m.font]} ${m.size} Tf ${c.red.toFixed(3)} ${c.green.toFixed(3)} ${c.blue.toFixed(3)} rg`));
+  dict.set(PDFName.of('DS'), PDFString.of(
+    `font: ${m.bold ? 'bold ' : ''}${m.size}pt ${CSS_FONT[m.font]}; color:${m.color}`));
+  dict.delete(PDFName.of('RC'));
+
+  const popup = refFromId(m.annot.popupId);
+  const popupDict = popup && ctx.lookupMaybe(popup, PDFDict);
+  if (popupDict?.has(PDFName.of('Contents'))) popupDict.set(PDFName.of('Contents'), PDFHexString.fromText(text));
+}
+
+function removeAnnot(pdfDoc, page, annot) {
+  const annots = page.node.Annots();
+  if (!annots) return;
+  for (const id of [annot.id, annot.popupId]) {
+    const ref = refFromId(id);
+    if (!ref) continue;
+    const idx = annots.indexOf(ref);
+    if (idx >= 0) annots.remove(idx);
+    pdfDoc.context.delete(ref);
+  }
+}
+
 /**
  * @param {Uint8Array} originalBytes
- * @param {{fields: Map, overlays: Array, pages: Array}} doc
+ * @param {{fields: Map, overlays: Array, deletedAnnots: Array, pages: Array}} doc
  *   pages[i].base is the pdf.js viewport at scale 1 used for overlay coordinates.
  */
-export async function buildPdf(originalBytes, { fields, overlays, pages }) {
+export async function buildPdf(originalBytes, { fields, overlays, deletedAnnots = [], pages }) {
   const pdfDoc = await PDFDocument.load(originalBytes, { updateMetadata: false });
   pdfDoc.registerFontkit(window.fontkit);
   const fonts = new FontCache(pdfDoc);
@@ -97,11 +164,17 @@ export async function buildPdf(originalBytes, { fields, overlays, pages }) {
     }
   }
 
-  // ---- overlays ----
   const docPages = pdfDoc.getPages();
+
+  for (const m of overlays) {
+    if (m.annot?.modified) await rewriteFreeText(pdfDoc, fonts, m, pages[m.pageIndex].base);
+  }
+  for (const annot of deletedAnnots) removeAnnot(pdfDoc, docPages[annot.pageIndex], annot);
+
+  // ---- overlays ----
   // Draw whiteout first so text/images placed on top of it stay visible.
   const order = { rect: 0, image: 1, text: 2 };
-  const sorted = [...overlays].sort((a, b) => order[a.type] - order[b.type]);
+  const sorted = overlays.filter((m) => !m.annot).sort((a, b) => order[a.type] - order[b.type]);
   for (const m of sorted) {
     const page = docPages[m.pageIndex];
     const vp = pages[m.pageIndex].base;
